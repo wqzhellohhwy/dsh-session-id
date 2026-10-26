@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-id",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "private": true,
   "type": "module",
   "description": "DSH web GUI 插件：在侧边栏底部加入「会话 ID」入口，打开面板列出全部会话的完整 ID，一键复制、本地搜索。纯浏览器端 UI（host 半边只提供自检状态查询）。",
@@ -32,3 +32,4 @@
     "esbuild": "^0.25.0"
   }
 }
+

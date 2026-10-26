@@ -309,16 +309,12 @@ export function lastLocateOutcome(): LocateOutcome | undefined {
 }
 
 /**
- * 首滚用的滚动行为：用户要求减少动态效果时瞬时，否则平滑。matchMedia 缺失/抛错一律瞬时。
+ * 首滚用的滚动行为：用户要求取消定位动画（长列表下平滑偏慢，且 content-visibility 行在
+ * 滚动途中重排会让画面抖），一律瞬时到位。保留函数形态，供探针按同源取值。
  * @returns `ScrollBehavior`。
  */
 export function locateScrollBehavior(): ScrollBehavior {
-  try {
-    if (typeof window.matchMedia !== 'function') return 'auto'
-    return window.matchMedia('(prefers-reduced-motion: reduce)').matches === true ? 'auto' : 'smooth'
-  } catch {
-    return 'auto'
-  }
+  return 'auto'
 }
 
 /**

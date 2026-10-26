@@ -636,8 +636,9 @@ export function installStyles(): () => void {
   }
   const style = document.createElement('style')
   style.dataset.plugin = SESSION_ID_PLUGIN_ATTR
-  style.dataset.rev = '1.8.0'
+  style.dataset.rev = '1.8.1'
   style.textContent = CSS
   document.head.appendChild(style)
   return () => { style.remove() }
 }
+

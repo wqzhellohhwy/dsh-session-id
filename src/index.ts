@@ -20,7 +20,7 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 
 export const name = 'dsh-session-id'
@@ -44,9 +44,6 @@ const reports = []
  * 这里只是第一道闸。
  */
 const SESSION_ID_RE = /^(?:session-)?[0-9a-fA-F][0-9a-fA-F-]{7,63}$/
-
-/** 合法回收站条目名：`<时间戳>-<会话 id>`（id 允许裸 uuid）。 */
-const TRASH_NAME_RE = /^\d{10,16}-(?:session-)?[0-9a-fA-F][0-9a-fA-F-]{7,63}$/
 
 /** 回收站条目里记录原路径的元数据文件名。 */
 const TRASH_META = 'trash-meta.json'
@@ -78,6 +75,35 @@ function sessionsRoot() {
 /** 回收站根。 */
 function trashRoot() {
   return join(dshHome(), 'sessions-trash')
+}
+
+/**
+ * 把回收站条目名解析成绝对路径（**不做**命名格式白名单）。
+ *
+ * 历史条目不一定符合本插件当前的 `<时间戳>-<会话 id>` 命名：例如事故期的
+ * `session-<uuid>.pre-turnfix-<时间戳>` 是手工放进去的真目录，用格式白名单会被永久拒删。
+ * 这里只做路径安全校验：单段名、无上级引用、无控制字符、解析后必须落在回收站根之下。
+ * @param name 条目名。
+ * @returns 绝对路径；不安全时返回 `undefined`。
+ */
+function trashEntryPath(name) {
+  if (typeof name !== 'string' || name === '' || name === '.' || name === '..') return undefined
+  if (/[\\/]/.test(name)) return undefined
+  if (/[\u0000-\u001f]/.test(name)) return undefined
+  const root = trashRoot()
+  const dir = join(root, name)
+  if (!dir.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)) return undefined
+  return dir
+}
+
+/**
+ * 从回收站条目名里解析会话 id（兼容 `<时间戳>-<id>` 与 `<id>.后缀` 两种历史形态）。
+ * @param name 条目名。
+ * @returns 会话 id；解析不出返回 `undefined`。
+ */
+function sessionIdFromTrashName(name) {
+  const match = /(?:session-)?[0-9a-fA-F][0-9a-fA-F-]{7,63}/.exec(name)
+  return match === null ? undefined : match[0]
 }
 
 /** 投影缓存目录（per-record 布局：每个会话一个 `<id>.json`）。 */
@@ -402,7 +428,7 @@ function listTrashItems() {
     const meta = readTrashMeta(dir)
     const sessionId = typeof meta?.sessionId === 'string'
       ? meta.sessionId
-      : (TRASH_NAME_RE.test(entry.name) ? entry.name.replace(/^\d+-/, '') : undefined)
+      : sessionIdFromTrashName(entry.name)
     items.push({
       name: entry.name,
       sessionId,
@@ -502,9 +528,8 @@ async function purgeTrashItems(ctx, names) {
   let projectionRemoved = 0
   for (const item of listTrashItems()) {
     if (wanted !== undefined && !wanted.includes(item.name)) continue
-    if (!TRASH_NAME_RE.test(item.name)) { failed.push({ name: item.name, error: 'invalid trash name' }); continue }
-    const dir = join(root, item.name)
-    if (!dir.startsWith(root)) { failed.push({ name: item.name, error: 'outside trash root' }); continue }
+    const dir = trashEntryPath(item.name)
+    if (dir === undefined) { failed.push({ name: item.name, error: 'unsafe trash entry name' }); continue }
     try {
       rmSync(dir, { recursive: true, force: true })
       if (typeof item.sessionId === 'string' && SESSION_ID_RE.test(item.sessionId)) {
@@ -585,10 +610,10 @@ function readHeaderCwd(dir) {
  * @returns 结果对象。
  */
 function restoreTrashItem(name) {
-  if (typeof name !== 'string' || !TRASH_NAME_RE.test(name)) return { ok: false, error: 'invalid trash name' }
+  const dir = trashEntryPath(name)
+  if (dir === undefined) return { ok: false, error: 'invalid trash name' }
   const root = trashRoot()
-  const dir = join(root, name)
-  if (!dir.startsWith(root) || !existsSync(dir)) return { ok: false, error: 'trash item not found' }
+  if (!existsSync(dir)) return { ok: false, error: 'trash item not found' }
   const meta = readTrashMeta(dir)
   let original = typeof meta?.originalDir === 'string' ? meta.originalDir : undefined
   let inferred = false
@@ -596,7 +621,9 @@ function restoreTrashItem(name) {
     // 老条目（或元数据丢了）没有原路径：从会话日志头里读 cwd 反推目录名。
     const cwd = readHeaderCwd(dir)
     if (cwd !== undefined) {
-      original = join(sessionsRoot(), projectKey(cwd), name.replace(/^\d+-/, ''))
+      // 目录名优先用名字里解析出的会话 id：历史条目可能没有 `<时间戳>-` 前缀，直接截前缀会得到错名。
+      const leaf = sessionIdFromTrashName(name) ?? name.replace(/^\d+-/, '')
+      original = join(sessionsRoot(), projectKey(cwd), leaf)
       inferred = true
     }
   }

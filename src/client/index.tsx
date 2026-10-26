@@ -44,10 +44,10 @@ export const inject = ['slots', 'locale', 'sessions']
 const ENTRY_ID = 'session-id'
 
 /** 自检用的版本标记。 */
-const VERSION = '1.8.0'
+const VERSION = '1.8.1'
 
 /** 每次构建递增：页面上的上报带这个数字，便于判断「跑的是哪一版」。 */
-const BUILD = 27
+const BUILD = 28
 
 /** 从 DOM 读当前生效的样式版本（用于确认热重载后样式真的换了）。 */
 function styleRev(): string {
@@ -1935,3 +1935,4 @@ export function apply(ctx: any): void {
 
   ctx.effect(() => () => { disposed = true }, `${name}: dispose flag`)
 }
+
