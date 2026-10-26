@@ -617,6 +617,7 @@ const CSS = `
   color: var(--sid-cyan);
   font-size: 12px;
 }
+.sid-row-notice { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* 回收站视图复用会话行的 .sid-row 结构，不另立样式。 */
 `

@@ -85,6 +85,87 @@ function projcacheSessionsDir() {
   return join(dshHome(), 'storages', 'session_projcache', 'sessions')
 }
 
+/** 端点标题缓存的有效期（含负缓存：读不到也记 60s，避免每次都去摸盘）。 */
+const TITLE_TTL_MS = 60_000
+
+/** 端点标题缓存：会话 id → `{ at, title }`（`title === undefined` 即负缓存）。 */
+const titleCache = new Map()
+
+/**
+ * 把投影缓存里的 `record.rows.title.val` 洗成可读标题。
+ *
+ * 本机实测三种形态：
+ *   ① 子代理的 title 是 `<system-reminder> You are teammate "p1-p`（被截断、无闭合引号）；
+ *   ② 以 `<` 开头的标签块；
+ *   ③ 正常的首行任务名（中文居多）。
+ * @param raw 原始 title。
+ * @returns 可读标题；洗不出内容时返回 undefined。
+ */
+function cleanProjectionTitle(raw) {
+  if (typeof raw !== 'string' || raw.trim() === '') return undefined
+  let text = raw
+  const teammate = /You are teammate "([^"\n]{1,60})/.exec(text)
+  if (teammate !== null) {
+    text = teammate[1].replace(/["',;:.!?]+$/, '')
+  } else if (text.trimStart().startsWith('<')) {
+    text = text.replace(/<[^>]*>[\s\S]*?<\/[^>]*>/g, ' ')
+    // 整个值就是一个标签块时上面的替换会把内容一起吃掉，退一步只剥标签保留文字。
+    if (text.trim() === '') text = raw.replace(/<[^>]*>/g, ' ')
+  }
+  const firstLine = text.split('\n')[0].replace(/\s+/g, ' ').trim()
+  if (firstLine === '') return undefined
+  return firstLine.slice(0, 40)
+}
+
+/**
+ * 把子代理的注册名（`record.rows.subagent.val.identity.label` / `.val.label`）洗成可读标题。
+ *
+ * 这是子代理**真实注册名/任务名**（实测形如「核验员V11：P7.3文档一致性」「查插件代码事实」），
+ * 比 `title.val` 里被截断的 teammate 串（`<system-reminder> You are teammate "v11-` → `v11-`）可读得多。
+ * @param raw 原始 label。
+ * @returns 压空白 + 剥控制字符 + 截 40 字后的标题；不是字符串或为空时返回 undefined。
+ */
+function cleanIdentityLabel(raw) {
+  if (typeof raw !== 'string') return undefined
+  const text = raw.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim()
+  if (text === '') return undefined
+  return text.slice(0, 40)
+}
+
+/**
+ * 读某个会话的投影缓存标题（60s 缓存 + 负缓存）。
+ *
+ * 取值优先级：`rows.subagent.val.identity.label` → `rows.subagent.val.label` → `rows.title.val` 清洗。
+ * 前两者是子代理注册名，只有它们都没有时才退回 title 清洗（普通会话走的正是这条回退路径）。
+ * @param sessionId 会话 id（调用方已过 SESSION_ID_RE）。
+ * @returns 可读标题；没有缓存文件 / 读不出 / 洗不净时返回 undefined。
+ */
+function projectionTitleOf(sessionId) {
+  const now = Date.now()
+  const hit = titleCache.get(sessionId)
+  if (hit !== undefined && now - hit.at < TITLE_TTL_MS) return hit.title
+  const dir = projcacheSessionsDir()
+  const bare = sessionId.replace(/^session-/, '')
+  let title
+  for (const name of [`${sessionId}.json`, `${bare}.json`]) {
+    const file = join(dir, name)
+    if (!existsSync(file)) continue
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8'))
+      const rows = parsed?.record?.rows
+      title = cleanIdentityLabel(rows?.subagent?.val?.identity?.label)
+        ?? cleanIdentityLabel(rows?.subagent?.val?.label)
+        ?? cleanProjectionTitle(rows?.title?.val)
+    } catch {
+      title = undefined
+    }
+    break
+  }
+  if (titleCache.size > 4000) titleCache.clear()
+  titleCache.set(sessionId, { at: now, title })
+  return title
+}
+
 /**
  * 按 session id 在 `sessions/` 根下反查会话目录。
  *
@@ -593,6 +674,30 @@ function summarize(report) {
     sessionId: report.sessionId,
     ok: report.ok,
     url: report.url,
+    args: report.args,
+    locate: report.locate,
+    archiveJump: report.archiveJump,
+    subagentProbe: report.subagentProbe,
+    target: report.target,
+    purge: report.purge,
+    confirm: report.confirm,
+    removeMessage: report.removeMessage,
+    archivedBefore: report.archivedBefore,
+    archivedAfter: report.archivedAfter,
+    present: report.present,
+    stillListed: report.stillListed,
+    skipped: report.skipped,
+    reason: report.reason,
+    errorName: report.errorName,
+    error: report.error,
+    already: report.already,
+    wasArchived: report.wasArchived,
+    attempts: report.attempts,
+    targetVisible: report.targetVisible,
+    targetVisibleBeforeClick: report.targetVisibleBeforeClick,
+    timelineLastVisible: report.timelineLastVisible,
+    timelineExtended: report.timelineExtended,
+    behaviorUsed: report.behaviorUsed,
   }
 }
 
@@ -616,27 +721,58 @@ export function apply(ctx) {
           reports.push({ at: Date.now(), ...body })
           while (reports.length > MAX_REPORTS) reports.shift()
           const command = takeCommand()
-          sendJson(res, 200, command === null ? { ok: true, count: reports.length } : { ok: true, count: reports.length, commands: [command.command] })
+          sendJson(res, 200, command === null
+            ? { ok: true, count: reports.length }
+            : { ok: true, count: reports.length, commands: [command.command], args: command.args })
         },
       }),
-      // 远程自检：给页面下发一条一次性指令（默认打开面板，可带 ?command=probe-row-hit 做命中探针）
+      // 远程自检：给页面下发一条一次性指令（默认打开面板；探针指令可带 target/purge/confirm 参数）
       webServer.register({
         kind: 'exact',
         path: '/api/session-id/selftest',
         handler: (req, res) => {
           if (!isLoopback(req)) return sendJson(res, 403, { ok: false, error: 'forbidden: loopback-only' })
           let command = 'open-panel'
+          const args: Record<string, unknown> = {}
           try {
             const url = new URL(String(req.url ?? ''), 'http://127.0.0.1')
             const asked = url.searchParams.get('command')
-            if (asked === 'probe-row-hit' || asked === 'probe-trash') command = asked
+            if (asked === 'probe-row-hit' || asked === 'probe-trash' || asked === 'probe-locate'
+              || asked === 'probe-subagent' || asked === 'probe-delete') command = asked
+            const target = url.searchParams.get('target')
+            if (typeof target === 'string' && SESSION_ID_RE.test(target)) args.target = target
+            const purge = url.searchParams.get('purge')
+            if (purge === '1' || purge === '0') args.purge = purge === '1'
+            const confirm = url.searchParams.get('confirm')
+            if (typeof confirm === 'string' && confirm !== '') args.confirm = confirm.slice(0, 16)
           } catch { /* 解析失败就用默认指令 */ }
-          pendingCommand = { command, seq: ++commandSeq, at: Date.now() }
+          pendingCommand = { command, seq: ++commandSeq, at: Date.now(), args }
           sendJson(res, 200, {
             ok: true,
             queued: pendingCommand,
             note: '将在下一次页面心跳（≤30s；刷新页面则 ≤2s）时执行，随后上报对应阶段',
           })
+        },
+      }),
+      // 批量取会话标题（T4：官方 list 快照给不出子代理可读名，标题在投影缓存里）
+      webServer.register({
+        kind: 'exact',
+        path: '/api/session-id/titles',
+        handler: async (req, res) => {
+          if (!isLoopback(req)) return sendJson(res, 403, { ok: false, error: 'forbidden: loopback-only' })
+          if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method not allowed' })
+          const body = await readJsonBody(req)
+          if (body === undefined) return sendJson(res, 400, { ok: false, error: 'invalid JSON' })
+          const asked = Array.isArray(body.sessionIds)
+            ? body.sessionIds.filter((id) => typeof id === 'string' && SESSION_ID_RE.test(id))
+            : []
+          const wanted = asked.slice(0, 200)
+          const titles = {}
+          for (const id of wanted) {
+            const title = projectionTitleOf(id)
+            if (title !== undefined) titles[id] = title
+          }
+          sendJson(res, 200, { ok: true, asked: asked.length, served: wanted.length, titles })
         },
       }),
       // 批量解析会话目录绝对路径（面板「路径」按钮复制用；回收站里的条目给回收站目录）
@@ -763,7 +899,7 @@ export function apply(ctx) {
         },
       }),
     ]
-    ctx.logger?.info?.('dsh-session-id: host face loaded (/api/session-id/{report,selftest,status,delete,paths,trash})')
+    ctx.logger?.info?.('dsh-session-id: host face loaded (/api/session-id/{report,selftest,status,delete,paths,trash,titles})')
     return () => {
       for (const dispose of disposers) if (typeof dispose === 'function') dispose()
     }

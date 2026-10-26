@@ -197,7 +197,8 @@ export interface ActionResult {
 
 /** 面板用到的全部动作（由外层注入；缺失的能力自动隐藏对应按钮）。 */
 export interface PanelActions {
-  open?: ((sessionId: string) => void) | undefined
+  /** 打开会话：可以是同步 `void`，也可以返回结果（归档会话要先解归档，失败要给原因）。 */
+  open?: ((sessionId: string) => void | Promise<ActionResult>) | undefined
   remove?: ((sessionId: string, purge: boolean) => Promise<ActionResult>) | undefined
   archive?: ((sessionId: string) => Promise<ActionResult>) | undefined
   unarchive?: ((sessionId: string) => Promise<ActionResult>) | undefined
@@ -239,6 +240,153 @@ const INITIAL_ROWS = 60
 const ROW_PAGE = 200
 /** 列表里最多渲染多少行。 */
 const MAX_ROWS = 2000
+
+/** 定位：首滚前要求 `scrollHeight` 连续多少帧不变（列表分次长个子结束）。 */
+const LOCATE_WAIT_STILL = 6
+/** 定位：`scrollTop` / `rowTop` 连续多少帧不变算停稳。 */
+const LOCATE_SETTLE_FRAMES = 3
+/** 定位：瞬时校正次数上限。 */
+const LOCATE_MAX_FIXES = 5
+/** 定位：单轮帧数上限（≈4 秒），超了如实报未到位。 */
+const LOCATE_MAX_FRAMES = 240
+/** 用户在列表上动一下就算介入定位（passive 监听）。 */
+const LOCATE_CANCEL_EVENTS: readonly string[] = ['wheel', 'touchstart', 'pointerdown']
+
+/** 几何快照（只取定位用得到的字段）。 */
+export interface RectMetrics {
+  top: number
+  bottom: number
+  left: number
+  width: number
+  height: number
+}
+
+/** 滚动容器（只取定位用得到的能力，便于单测传假对象）。 */
+export interface ScrollBoxMetrics {
+  scrollTop: number
+  clientHeight: number
+  getBoundingClientRect(): RectMetrics
+  scrollTo?: ((options: { top: number, behavior?: ScrollBehavior }) => void) | undefined
+}
+
+/** 一次校正前的几何快照（探针同源测量用）。 */
+export interface LocateTrace {
+  scrollTop: number
+  rowTop: number
+  rowHeight: number
+  boxTop: number
+  boxHeight: number
+}
+
+/** 一轮定位的结局（探针同源测量用）。 */
+export interface LocateOutcome {
+  behavior: ScrollBehavior
+  corrections: number
+  reached: boolean
+  frames: number
+  settleScrollTop: number
+  settleScrollHeight: number
+  boxRect: { top: number, height: number }
+  rowRect: { top: number, height: number }
+  correctionsTrace: LocateTrace[]
+}
+
+/** 一轮定位里要跨函数传递的把手（旧轮靠引用不等自动作废）。 */
+interface LocateRunHandle {
+  raf: number
+  detach: () => void
+}
+
+/** 最近一轮定位的结局（每轮收尾都写，成功失败都写）。 */
+let lastOutcome: LocateOutcome | undefined
+
+/**
+ * 读最近一轮定位的结局。
+ * @returns 结局；从未定位过时为 `undefined`。
+ */
+export function lastLocateOutcome(): LocateOutcome | undefined {
+  return lastOutcome
+}
+
+/**
+ * 首滚用的滚动行为：用户要求减少动态效果时瞬时，否则平滑。matchMedia 缺失/抛错一律瞬时。
+ * @returns `ScrollBehavior`。
+ */
+export function locateScrollBehavior(): ScrollBehavior {
+  try {
+    if (typeof window.matchMedia !== 'function') return 'auto'
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches === true ? 'auto' : 'smooth'
+  } catch {
+    return 'auto'
+  }
+}
+
+/**
+ * 取元素几何快照。
+ * @param node 任何能拿到 rect 的元素。
+ * @returns 六字段快照。
+ */
+function rectOf(node: { getBoundingClientRect(): RectMetrics }): RectMetrics {
+  const rect = node.getBoundingClientRect()
+  return { top: rect.top, bottom: rect.bottom, left: rect.left, width: rect.width, height: rect.height }
+}
+
+/**
+ * 目标行是否整行落在容器可视区内（±1px 容差）。
+ * @param box 容器 rect。
+ * @param row 行 rect。
+ * @returns 两者行列比例有效且行完全在框内才为真。
+ */
+export function rowInsideBox(box: RectMetrics, row: RectMetrics): boolean {
+  if (!(box.width > 0) || !(box.height > 0)) return false
+  if (!(row.width > 0) || !(row.height > 0)) return false
+  return row.top >= box.top - 1 && row.bottom <= box.bottom + 1
+}
+
+/**
+ * 把目标行滚到容器正中：只 `Math.max(0, top)`，不按 `scrollHeight - clientHeight` 夹
+ * （content-visibility 下那个高度是估算值，夹了会停在半路）。
+ * @param box 容器。
+ * @param row 行 rect。
+ * @param behavior 滚动行为。
+ * @returns 下发的目标 scrollTop。
+ */
+export function scrollRowIntoBox(box: ScrollBoxMetrics, row: RectMetrics, behavior: ScrollBehavior): number {
+  const boxRect = box.getBoundingClientRect()
+  const top = Math.max(0, box.scrollTop + (row.top - boxRect.top) - (box.clientHeight - row.height) / 2)
+  if (typeof box.scrollTo === 'function') {
+    try { box.scrollTo({ top, behavior }) } catch { box.scrollTop = top }
+  } else {
+    box.scrollTop = top
+  }
+  return top
+}
+
+/**
+ * 目标行是否真的被画出来了（识破 content-visibility 跳过布局却报 rect 在框内的假绿）。
+ * @param row 目标行元素。
+ * @param rowRect 行 rect。
+ * @returns 行中心点命中该行或其子元素为真；取不到点位时退回 `true`。
+ */
+function rowPainted(row: HTMLElement, rowRect: RectMetrics): boolean {
+  try {
+    if (typeof document.elementFromPoint !== 'function') return true
+    const hit = document.elementFromPoint(rowRect.left + rowRect.width / 2, rowRect.top + rowRect.height / 2)
+    if (hit === null || hit === undefined) return false
+    return hit === row || row.contains(hit)
+  } catch {
+    return true
+  }
+}
+
+/**
+ * 动作是不是 thenable（面板动作允许同步 `void` 与异步结果两种形态）。
+ * @param value 动作返回值。
+ * @returns 是 Promise 形态才为真。
+ */
+function isThenable(value: void | ActionResult | Promise<ActionResult>): value is Promise<ActionResult> {
+  return typeof (value as Promise<ActionResult> | null | undefined)?.then === 'function'
+}
 
 /**
  * 当前会话 id（主视图 retain 的那个）。
@@ -369,6 +517,8 @@ function SessionRow({ session, isCurrent, isArchived, isHidden, isSubagent, sele
   const [copyStatus, setCopyStatus] = React.useState<CopyKind | 'failed' | undefined>(undefined)
   const [confirming, setConfirming] = React.useState(false)
   const [status, setStatus] = React.useState<'idle' | 'busy' | 'failed' | 'done' | 'archived' | 'unarchived'>('idle')
+  /** 行内提示（打开失败的原因就显示在这里，面板不关）。 */
+  const [notice, setNotice] = React.useState<string | undefined>(undefined)
   const title = titleOf(session)
   const updatedAt = session.updatedAt
   const timeLabel = updatedAt === undefined
@@ -429,7 +579,22 @@ function SessionRow({ session, isCurrent, isArchived, isHidden, isSubagent, sele
       const selection = window.getSelection()
       if (selection !== null && selection !== undefined && selection.toString() !== '') return
     } catch { /* 取不到选区就按点击处理 */ }
-    actions.open(session.id)
+    setNotice(undefined)
+    const result = actions.open(session.id)
+    if (isThenable(result)) {
+      // 归档会话要先解归档再打开：只有真的打开了才关面板，失败就留着面板并说明原因。
+      void result.then((outcome) => {
+        if (outcome?.ok === true) {
+          report('jumped', { sessionId: session.id })
+          if (settings.closeOnOpen) onClose()
+          return
+        }
+        setNotice(String(t('panel.openFailed', { message: outcome?.message ?? '' })))
+      }).catch((error: unknown) => {
+        setNotice(String(t('panel.openFailed', { message: String((error as Error)?.message ?? error) })))
+      })
+      return
+    }
     report('jumped', { sessionId: session.id })
     if (settings.closeOnOpen) onClose()
   }
@@ -495,6 +660,9 @@ function SessionRow({ session, isCurrent, isArchived, isHidden, isSubagent, sele
       }
 
       <span className="sid-row-actions" onClick={stop}>
+        {notice === undefined
+          ? null
+          : <span className="sid-hint sid-row-notice" title={notice}>{notice}</span>}
         <button
           type="button"
           className="sid-action"
@@ -718,6 +886,19 @@ export function SessionIdPanel({
   const [trashBusy, setTrashBusy] = React.useState(false)
   const listRef = React.useRef<HTMLDivElement | null>(null)
   const located = React.useRef(false)
+  /** 自动定位只试一次（失败也不反复重试）。 */
+  const autoLocateTried = React.useRef(false)
+  /** 进行中的那一轮定位。 */
+  const locateRunRef = React.useRef<LocateRunHandle | undefined>(undefined)
+
+  /** 作废进行中的一轮定位（旧轮的所有 rAF 回调与监听一并清掉）。 */
+  const cancelLocate = React.useCallback((): void => {
+    const run = locateRunRef.current
+    locateRunRef.current = undefined
+    if (run === undefined) return
+    window.cancelAnimationFrame(run.raf)
+    run.detach()
+  }, [])
 
   const isArchived = React.useCallback(
     (row: SessionSummary): boolean => row.archived === true || archivedSet.has(row.id),
@@ -764,6 +945,30 @@ export function SessionIdPanel({
     })
   }, [allRows, filter, isArchived, query, view, hiddenSet, settings.subagentFilter, settings.workspaceFilter, settings.searchScope, workspaceKeyOf])
 
+  /** 按工作区分组（找不到归属的进「未分组」）。分组视图渲染全量 rows，不受 `visibleCount` 限制。 */
+  const grouped = React.useMemo(() => {
+    if (!settings.grouped || view !== 'list') return undefined
+    const buckets = new Map<string, { title: string, ungrouped: boolean, rows: SessionSummary[] }>()
+    const idOf = (workspace: WorkspaceGroup): string => workspace.workspaceId ?? workspace.id ?? workspace.path ?? ''
+    const byPath = new Map<string, WorkspaceGroup>()
+    for (const workspace of workspaceItems) {
+      if (typeof workspace.path === 'string') byPath.set(workspace.path, workspace)
+    }
+    for (const row of rows) {
+      const bySessions = workspaceItems.find((workspace) => workspace.sessionIds?.includes(row.id) === true)
+      const workspace = bySessions ?? (row.cwd === undefined ? undefined : byPath.get(row.cwd))
+      const key = workspace === undefined ? '' : idOf(workspace)
+      const title = workspace === undefined
+        ? String(t('panel.ungrouped'))
+        : (workspace.title ?? workspace.path ?? String(t('panel.groupUnknown')))
+      const bucket = buckets.get(key) ?? { title, ungrouped: workspace === undefined, rows: [] }
+      bucket.rows.push(row)
+      buckets.set(key, bucket)
+    }
+    // 未分组排最后
+    return [...buckets.values()].sort((a, b) => (a.ungrouped === b.ungrouped ? 0 : a.ungrouped ? 1 : -1))
+  }, [settings.grouped, view, rows, workspaceItems, t])
+
   React.useEffect(() => { setVisibleCount(INITIAL_ROWS) }, [query, filter, sortMode, view])
 
   const shown = rows.slice(0, visibleCount)
@@ -780,37 +985,171 @@ export function SessionIdPanel({
     return () => { document.removeEventListener('keydown', onKey) }
   }, [onClose])
 
-  /** 滚动到当前会话那一行。 */
-  const scrollToCurrent = React.useCallback((): boolean => {
-    try {
-      const node = listRef.current?.querySelector('[data-active="true"]')
-      if (node === null || node === undefined) return false
-      node.scrollIntoView({ block: 'center' })
-      return true
-    } catch {
-      return false
+  /**
+   * 起一轮定位：rAF 状态机，等列表长完个子 → 首滚（居中）→ 停稳 → 判到位 → 不达标瞬时校正。
+   *
+   * 为什么不能「setVisibleCount 之后 setTimeout 再 querySelector」：展开行数只是排期，
+   * `index+1` 行在首屏 60 行之外时，这次 commit 要新建上千个 DOM 节点，行还没进 DOM
+   * 定时器就到了，`querySelector('[data-active=true]')` 拿到 null ⇒ 静默失败，第二次点才中。
+   * @param hint 用户手动点的（失败要提示；自动定位不弹提示）。
+   * @param need 目标行需要的可见行数（= 下标 + 1）。
+   */
+  const startLocate = (hint: boolean, need: number): void => {
+    const box = listRef.current
+    if (box === null) return
+    cancelLocate()
+    const behavior = locateScrollBehavior()
+    const trace: LocateTrace[] = []
+    let frame = 0
+    let waitStill = 0
+    let prevHeight = -1
+    let still = 0
+    let corrections = 0
+    let scrolled = false
+    let scrollHeightAtScroll = -1
+    let lastScrollTop = -1
+    let lastRowTop = -1
+    let target: number | undefined
+    let row: HTMLElement | undefined
+
+    const findRow = (): HTMLElement | undefined => {
+      const node = box.querySelector(`[data-dsh-part="${SESSION_ID_PART.row}"][data-active="true"]`)
+      return node === null ? undefined : node as HTMLElement
     }
-  }, [])
+    const onUserScroll = (): void => { cancelLocate() }
+    const detach = (): void => {
+      for (const type of LOCATE_CANCEL_EVENTS) box.removeEventListener(type, onUserScroll)
+    }
+    const handle: LocateRunHandle = { raf: 0, detach }
+    const schedule = (): void => { handle.raf = window.requestAnimationFrame(step) }
 
-  React.useEffect(() => {
-    if (view !== 'list' || !settings.autoLocate || located.current) return
-    const timer = window.setTimeout(() => {
-      located.current = true
-      scrollToCurrent()
-    }, 30)
-    return () => { window.clearTimeout(timer) }
-  }, [view, settings.autoLocate, shown.length, scrollToCurrent])
+    /** 收尾：写结局、解绑、必要时提示。旧轮一律不写（防旧轮覆盖新一轮）。 */
+    const settle = (reached: boolean): void => {
+      if (locateRunRef.current !== handle) return
+      locateRunRef.current = undefined
+      window.cancelAnimationFrame(handle.raf)
+      detach()
+      const boxRect = rectOf(box)
+      const rowRect = row === undefined
+        ? { top: 0, bottom: 0, left: 0, width: 0, height: 0 }
+        : rectOf(row)
+      lastOutcome = {
+        behavior,
+        corrections,
+        reached,
+        frames: frame,
+        settleScrollTop: Math.round(box.scrollTop),
+        settleScrollHeight: Math.round(box.scrollHeight),
+        boxRect: { top: Math.round(boxRect.top), height: Math.round(boxRect.height) },
+        rowRect: { top: Math.round(rowRect.top), height: Math.round(rowRect.height) },
+        correctionsTrace: trace,
+      }
+      report(reached ? 'locate-reached' : 'locate-missed', { frames: frame, corrections })
+      if (reached) {
+        located.current = true
+        setNote(undefined)
+      } else if (hint) {
+        setNote(String(t('panel.locateNotReached')))
+      }
+    }
 
-  const handleLocate = (): void => {
-    if (current === undefined || rows.findIndex((row) => row.id === current) < 0) {
-      setNote(String(t('panel.locateMissing')))
+    const step = (): void => {
+      if (locateRunRef.current !== handle) return
+      frame += 1
+      if (frame > LOCATE_MAX_FRAMES) { settle(false); return }
+      const scrollHeight = box.scrollHeight
+      if (scrollHeight === prevHeight) waitStill += 1
+      else { prevHeight = scrollHeight; waitStill = 0 }
+      // ① 行数到位且列表连续多帧不长个子，才算能算 top（分次扩张会把目标行一直往下推）
+      if (box.querySelectorAll('.sid-row').length < need || waitStill < LOCATE_WAIT_STILL) { schedule(); return }
+      if (row === undefined || !row.isConnected) row = findRow()
+      if (row === undefined) { schedule(); return }
+      const rowRect = rectOf(row)
+      // ② 高度又变了 ⇒ 目标被推下去：按新几何瞬时追随，本轮不判到位
+      if (scrolled && scrollHeight !== scrollHeightAtScroll) {
+        still = 0
+        scrollHeightAtScroll = scrollHeight
+        target = scrollRowIntoBox(box, rowRect, 'auto')
+        schedule()
+        return
+      }
+      // ③ 首滚：只有这一次用平滑（prefers-reduced-motion 时瞬时）
+      if (!scrolled) {
+        scrolled = true
+        scrollHeightAtScroll = scrollHeight
+        target = scrollRowIntoBox(box, rowRect, behavior)
+        schedule()
+        return
+      }
+      // ④ 三稳 3 帧：scrollTop 与目标行 rowTop（scrollHeight 由 ② 守住）
+      const scrollTop = box.scrollTop
+      const rowTop = Math.round(rowRect.top)
+      if (scrollTop === lastScrollTop && rowTop === lastRowTop) still += 1
+      else { lastScrollTop = scrollTop; lastRowTop = rowTop; still = 0 }
+      if (still < LOCATE_SETTLE_FRAMES) { schedule(); return }
+      // ⑤ 到位判据：整行在框内 且 真的画出来了
+      const boxRect = rectOf(box)
+      if (rowInsideBox(boxRect, rowRect) && rowPainted(row, rowRect)) { settle(true); return }
+      // ⑥ 不达标：瞬时校正，上限 5 次；目标值不再变说明被滚到底夹住了，直接如实报失败
+      if (corrections >= LOCATE_MAX_FIXES) { settle(false); return }
+      corrections += 1
+      trace.push({
+        scrollTop: Math.round(scrollTop),
+        rowTop,
+        rowHeight: Math.round(rowRect.height),
+        boxTop: Math.round(boxRect.top),
+        boxHeight: Math.round(boxRect.height),
+      })
+      const next = scrollRowIntoBox(box, rowRect, 'auto')
+      if (next === target) { settle(false); return }
+      target = next
+      still = 0
+      schedule()
+    }
+
+    for (const type of LOCATE_CANCEL_EVENTS) box.addEventListener(type, onUserScroll, { passive: true })
+    locateRunRef.current = handle
+    schedule()
+  }
+
+  /**
+   * 定位当前会话：太靠后先展开行数，再起一轮 rAF 状态机。
+   * @param hint 用户手动点的（失败要提示）。
+   */
+  const locateCurrent = (hint: boolean): void => {
+    if (current === undefined) {
+      if (hint) setNote(String(t('panel.locateMissing')))
       return
     }
     const index = rows.findIndex((row) => row.id === current)
+    if (index < 0) {
+      if (hint) setNote(String(t('panel.locateMissing')))
+      return
+    }
+    const need = index + 1
+    // 分组视图渲染全量 rows，不受 MAX_ROWS 限制；平铺视图只能展开到上限，超了就说明白
+    if (grouped === undefined && need > MAX_ROWS) {
+      setNote(String(t('panel.locateBeyondLimit', { index: need, n: MAX_ROWS })))
+      setVisibleCount((count) => (count >= MAX_ROWS ? count : MAX_ROWS))
+      return
+    }
     setNote(undefined)
-    if (index >= visibleCount) setVisibleCount(index + 1)
-    window.setTimeout(() => { scrollToCurrent() }, 30)
+    if (grouped === undefined && need > visibleCount) setVisibleCount(need)
+    startLocate(hint, need)
   }
+
+  React.useEffect(() => {
+    if (view !== 'list' || !settings.autoLocate || located.current || autoLocateTried.current) return
+    if (locateRunRef.current !== undefined) return
+    if (current === undefined) return
+    autoLocateTried.current = true
+    locateCurrent(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 定位实现每次渲染重建，靠 ref 守卫「只试一次」
+  }, [view, settings.autoLocate, shown.length, current])
+
+  React.useEffect(() => () => { cancelLocate() }, [cancelLocate])
+
+  const handleLocate = (): void => { locateCurrent(true) }
 
   const refreshTrash = React.useCallback((): void => {
     if (actions.listTrash === undefined) {
@@ -962,30 +1301,6 @@ export function SessionIdPanel({
     if (settings.deleteNoConfirm) runBatchDelete(settings.deleteMode === 'purge')
     else setBatchConfirm(true)
   }
-
-  /** 按工作区分组（找不到归属的进「未分组」）。 */
-  const grouped = React.useMemo(() => {
-    if (!settings.grouped || view !== 'list') return undefined
-    const buckets = new Map<string, { title: string, ungrouped: boolean, rows: SessionSummary[] }>()
-    const idOf = (workspace: WorkspaceGroup): string => workspace.workspaceId ?? workspace.id ?? workspace.path ?? ''
-    const byPath = new Map<string, WorkspaceGroup>()
-    for (const workspace of workspaceItems) {
-      if (typeof workspace.path === 'string') byPath.set(workspace.path, workspace)
-    }
-    for (const row of rows) {
-      const bySessions = workspaceItems.find((workspace) => workspace.sessionIds?.includes(row.id) === true)
-      const workspace = bySessions ?? (row.cwd === undefined ? undefined : byPath.get(row.cwd))
-      const key = workspace === undefined ? '' : idOf(workspace)
-      const title = workspace === undefined
-        ? String(t('panel.ungrouped'))
-        : (workspace.title ?? workspace.path ?? String(t('panel.groupUnknown')))
-      const bucket = buckets.get(key) ?? { title, ungrouped: workspace === undefined, rows: [] }
-      bucket.rows.push(row)
-      buckets.set(key, bucket)
-    }
-    // 未分组排最后
-    return [...buckets.values()].sort((a, b) => (a.ungrouped === b.ungrouped ? 0 : a.ungrouped ? 1 : -1))
-  }, [settings.grouped, view, rows, workspaceItems, t])
 
   const hiddenCount = React.useMemo(
     () => allRows.filter((row) => hiddenSet.has(row.id)).length,
